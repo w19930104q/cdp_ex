@@ -91,6 +91,25 @@ defmodule CDPEx.Telemetry do
         `{:devtools_file_malformed, contents_excerpt}` or
         `{:connect_discovery_failed, :discovery_timeout}`
 
+  ### `[:cdp_ex, :pool, :browser_retired]`
+
+  A `CDPEx.Pool` took a browser out of rotation instead of returning it to the
+  available set — the self-healing side of a pool lease.
+
+    * measurements — `%{system_time: System.system_time()}`
+    * metadata — `%{reason: reason}`, one of:
+      * `{:contaminated, inner}` — the lease was marked suspect at check-in
+        (typically `{:contaminated, {:timeout, :new_page}}`: a page that may
+        still open late and unowned, so the browser can't be trusted for the
+        next job)
+      * `{:abandoned, exit_reason}` — the checkout owner died while still
+        holding the lease, so its half-finished browser is retired
+      * `{:lease_stopped, reason}` — a lease stopped any other way; its browser
+        is treated as untrusted rather than reused
+
+  A browser that crashed outright emits the usual `[:cdp_ex, :error]` fault
+  event(s) instead; its lease simply frees the slot and the pool backfills it.
+
   ### `[:cdp_ex, :error]`
 
   A genuine fault — a page's WebSocket closed unexpectedly, the browser connection went
@@ -158,6 +177,16 @@ defmodule CDPEx.Telemetry do
       [:cdp_ex, :with_page, :deadline_exceeded],
       %{system_time: System.system_time()},
       metadata
+    )
+  end
+
+  @doc false
+  @spec pool_browser_retired(term()) :: :ok
+  def pool_browser_retired(reason) do
+    :telemetry.execute(
+      [:cdp_ex, :pool, :browser_retired],
+      %{system_time: System.system_time()},
+      %{reason: reason}
     )
   end
 

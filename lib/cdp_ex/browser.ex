@@ -120,8 +120,11 @@ defmodule CDPEx.Browser do
   A browser that is gone, or stops before replying, returns `{:error, :noproc}`. One
   that can't serve the request within 75s returns `{:error, {:timeout, :new_page}}`;
   a page it still opens after that is not handed to anyone and stays open until the
-  browser stops, so retrying on the same browser can pile these up — prefer a fresh
-  browser (or stop this one) after a timeout.
+  browser stops, so retrying on the same browser can pile these up. When the browser
+  comes from a `CDPEx.Pool`, `CDPEx.Pool.with_page/3` handles this for you — it
+  contaminates the lease on this exact error, so the browser is retired and replaced
+  at check-in instead of carrying a stray, unowned tab into the next rental. Against
+  a directly managed browser, stop it and launch a fresh one after a timeout.
   """
   @spec new_page(GenServer.server(), keyword()) :: {:ok, Page.t()} | {:error, term()}
   # The call timeout covers the worst-case internal budget — Target.createTarget

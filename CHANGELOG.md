@@ -6,6 +6,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- `CDPEx.Pool` checkouts now run under an isolated, self-healing **lease** (`CDPEx.Lease`): `checkout/2` returns a lease pid instead of a browser pid — resolve it with `CDPEx.Lease.browses/1`, or keep using `with_browser/3` / `with_page/3`, which are unchanged. A timeout, cancellation or owner death settles only that lease; a timed-out `new_page/2` (whose tab may still open late and unowned) contaminates the browser so it is retired and replaced at check-in rather than leaking into the next rental, and owner deaths / crashed browsers likewise free capacity and backfill to `:size` without ever handing a waiter a dead instance. Retirements emit the new `[:cdp_ex, :pool, :browser_retired]` telemetry event (#145).
+
 ## [0.14.0] - 2026-10-22
 
 ### Changed

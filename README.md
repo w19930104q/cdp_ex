@@ -220,8 +220,29 @@ end)
 Browsers launch lazily up to `:size` and are reused; `checkout/2` blocks (up to
 `:checkout_timeout`) when all are busy. Launches are asynchronous, so the pool
 stays responsive during a cold start and warms multiple browsers concurrently
-under load. A caller that crashes returns its browser automatically, and a
-crashed browser is relaunched on demand.
+under load.
+
+Each checkout runs under its own **lease**, a process that isolates one rental's
+fate: a timeout, cancellation, or caller crash settles only that lease and never
+disturbs the other rentals. A `new_page/2` that times out can still open its tab
+afterwards, unowned — `Pool.with_page/3` marks that browser contaminated, so it is
+**retired** (stopped) at check-in and replaced with a fresh launch rather than
+handing the next job a browser carrying a stray tab (e.g. a previous job's login
+page). A caller that dies mid-rental likewise retires the browser it was using,
+and a crashed browser is simply dropped; each case frees capacity and self-heals
+back to `:size`, so a waiting checkout is never handed a dead or retired instance.
+Retirements emit `[:cdp_ex, :pool, :browser_retired]` (see `CDPEx.Telemetry`).
+
+For manual control, `checkout/2` returns a lease pid — resolve the browser with
+`CDPEx.Lease.browses/1` and always finish with `checkin/2` (or use
+`with_browser/3` / `with_page/3`, which do both for you):
+
+```elixir
+{:ok, lease} = CDPEx.Pool.checkout(MyPool)
+{:ok, browser} = CDPEx.Lease.browses(lease)
+CDPEx.Lease.contaminate(lease, :some_reason) # retire instead of reuse at check-in
+CDPEx.Pool.checkin(MyPool, lease)            # idempotent
+```
 
 ## Page operations
 
@@ -430,6 +451,7 @@ offers no way to label a supervisor from outside it.)
 | `{:cdp_fetch_auth, source}` | the `Fetch` auth handler (`:proxy`, `:server`, or `:any`) |
 | `{:cdp_fetch_disable, conn}` | the throwaway task that releases interception after its owner dies |
 | `{:cdp_pool, size}` / `{:cdp_pool_launch, pool}` | `CDPEx.Pool` and its browser-launch tasks |
+| `{:cdp_pool_lease, browser}` | the per-checkout `CDPEx.Lease` guarding one rental of `browser` |
 | `{:cdp_deadline, ms}` | the watchdog behind `with_page/3`'s `:deadline` |
 
 The page-helper label is the one to reach for when a scrape appears hung: it

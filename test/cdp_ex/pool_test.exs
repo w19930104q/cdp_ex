@@ -3,19 +3,10 @@ defmodule CDPEx.PoolTest do
 
   import ExUnit.CaptureLog
 
+  alias CDPEx.Lease
   alias CDPEx.Pool
-
-  # A stand-in for CDPEx.Browser: a trivial GenServer (so Pool's Browser.stop/1 —
-  # a GenServer.stop — works) injected via the :start_fun option, letting us drive
-  # the whole pool without launching Chrome.
-  defmodule FakeBrowser do
-    @moduledoc false
-    use GenServer
-
-    def start_link(_opts \\ []), do: GenServer.start_link(__MODULE__, :ok)
-    @impl true
-    def init(:ok), do: {:ok, :ok}
-  end
+  alias CDPEx.TestPoolBrowsers.FakeBrowser
+  alias CDPEx.TestPoolBrowsers.PageBrowser
 
   setup do
     # The pool is start_linked to the test process; trap exits so a pool stop in
@@ -24,89 +15,249 @@ defmodule CDPEx.PoolTest do
     :ok
   end
 
+  # ── basic pool mechanics ──────────────────────────────────────────────────────
+
   test "checkout lazily launches up to size, then reuses warm browsers" do
     pool = start_pool(size: 2)
 
-    {:ok, b1} = Pool.checkout(pool)
-    {:ok, b2} = Pool.checkout(pool)
+    {:ok, l1} = Pool.checkout(pool)
+    {:ok, b1} = Lease.browses(l1)
+    {:ok, l2} = Pool.checkout(pool)
+    {:ok, b2} = Lease.browses(l2)
     assert b1 != b2
     assert :sys.get_state(pool).count == 2
 
-    :ok = Pool.checkin(pool, b1)
+    :ok = Pool.checkin(pool, l1)
     # Reuses the freed browser instead of launching a third.
-    assert {:ok, ^b1} = Pool.checkout(pool)
+    assert {:ok, l3} = Pool.checkout(pool)
+    assert {:ok, ^b1} = Lease.browses(l3)
     assert :sys.get_state(pool).count == 2
   end
 
   test "checkout blocks when the pool is exhausted and is served on checkin" do
     pool = start_pool(size: 1)
-    {:ok, b1} = Pool.checkout(pool)
+    {:ok, l1} = Pool.checkout(pool)
 
     task = Task.async(fn -> Pool.checkout(pool, 1_000) end)
     refute Task.yield(task, 100), "checkout should block while the pool is exhausted"
 
-    :ok = Pool.checkin(pool, b1)
-    assert {:ok, ^b1} = Task.await(task)
+    :ok = Pool.checkin(pool, l1)
+    assert {:ok, _lease} = Task.await(task)
   end
 
   test "checkout times out when no browser frees up in time" do
     pool = start_pool(size: 1)
-    {:ok, _b1} = Pool.checkout(pool)
+    {:ok, _l1} = Pool.checkout(pool)
     assert {:error, :timeout} = Pool.checkout(pool, 100)
   end
 
-  test "with_browser returns the fun's value and checks the browser back in" do
+  test "with_browser passes the browser pid and checks the lease back in" do
     pool = start_pool(size: 1)
     assert :hello = Pool.with_browser(pool, fn _b -> :hello end)
-    assert {:ok, _b} = Pool.checkout(pool, 500)
+    assert {:ok, _l} = Pool.checkout(pool, 500)
   end
 
-  test "with_browser checks the browser back in even when the fun raises" do
+  test "with_browser ends the lease even when the fun raises" do
     pool = start_pool(size: 1)
     assert_raise RuntimeError, fn -> Pool.with_browser(pool, fn _b -> raise "boom" end) end
-    assert {:ok, _b} = Pool.checkout(pool, 500)
+    assert {:ok, _l} = Pool.checkout(pool, 500)
   end
 
-  test "with_browser checks the browser back in even when the fun exits" do
+  test "with_browser ends the lease even when the fun exits" do
     pool = start_pool(size: 1)
-    # `after` runs on an exit too, so the browser is still returned.
+    # `after` runs on an exit too, so the lease is still ended.
     catch_exit(Pool.with_browser(pool, fn _b -> exit(:boom) end))
-    assert {:ok, _b} = Pool.checkout(pool, 500)
+    assert {:ok, _l} = Pool.checkout(pool, 500)
   end
 
-  test "a checkout owner that crashes has its browser reclaimed" do
-    pool = start_pool(size: 1)
+  # ── lease isolation: owner death ──────────────────────────────────────────────
+
+  test "a checkout owner that crashes has its lease settled without touching other rentals" do
+    pool = start_pool(size: 2)
+    {:ok, survivor_lease} = Pool.checkout(pool)
+    {:ok, survivor} = Lease.browses(survivor_lease)
+
     parent = self()
 
     {owner, _ref} =
       spawn_monitor(fn ->
-        {:ok, b} = Pool.checkout(pool)
-        send(parent, {:checked_out, b})
+        {:ok, lease} = Pool.checkout(pool)
+        {:ok, browser} = Lease.browses(lease)
+        send(parent, {:checked_out, lease, browser})
         Process.sleep(:infinity)
       end)
 
-    assert_receive {:checked_out, b1}, 1_000
-    # Pool exhausted (size 1; the owner holds b1). Kill the owner.
-    Process.exit(owner, :kill)
-    # The pool reclaims b1 via the owner monitor, so it can be checked out again.
-    assert {:ok, ^b1} = Pool.checkout(pool, 1_000)
+    assert_receive {:checked_out, lease, browser}, 1_000
+
+    assert_retires(pool, :abandoned, fn ->
+      Process.exit(owner, :kill)
+      assert_down(lease)
+    end)
+
+    # The abandoned browser is retired (its stop runs when the pool settles the
+    # lease's EXIT) and its slot freed.
+    assert eventually(fn -> not Process.alive?(browser) end)
+    assert eventually(fn -> :sys.get_state(pool).count == 1 end)
+
+    # The other rental is completely untouched: same lease, same browser.
+    assert {:ok, ^survivor} = Lease.browses(survivor_lease)
+    assert Process.alive?(survivor)
   end
 
-  test "a crashed browser is dropped and replaced on the next checkout" do
-    pool = start_pool(size: 1)
-    {:ok, b1} = Pool.checkout(pool)
-    :ok = Pool.checkin(pool, b1)
+  # ── lease isolation: browser death ────────────────────────────────────────────
 
-    Process.exit(b1, :kill)
+  test "a browser that crashes while busy frees only its own lease and is replaced" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    {:ok, browser} = Lease.browses(lease)
+
+    Process.exit(browser, :kill)
+    assert_down(lease)
     assert eventually(fn -> :sys.get_state(pool).count == 0 end)
 
-    assert {:ok, b2} = Pool.checkout(pool, 1_000)
-    assert b2 != b1
+    # A waiter never gets the dead pid: the replacement is a fresh browser.
+    assert {:ok, new_lease} = Pool.checkout(pool, 1_000)
+    {:ok, new_browser} = Lease.browses(new_lease)
+    assert new_browser != browser
+    assert Process.alive?(new_browser)
+    assert :sys.get_state(pool).count == 1
   end
+
+  test "a crashed available browser is dropped and replaced on the next checkout" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    {:ok, browser} = Lease.browses(lease)
+    :ok = Pool.checkin(pool, lease)
+
+    Process.exit(browser, :kill)
+    assert eventually(fn -> :sys.get_state(pool).count == 0 end)
+
+    assert {:ok, new_lease} = Pool.checkout(pool, 1_000)
+    {:ok, new_browser} = Lease.browses(new_lease)
+    assert new_browser != browser
+  end
+
+  test "a lease whose browser dies reports :noproc from browses/1 instead of a dead pid" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    {:ok, browser} = Lease.browses(lease)
+
+    Process.exit(browser, :kill)
+    assert eventually(fn -> not Process.alive?(lease) end)
+    assert Lease.browses(lease) == {:error, :noproc}
+  end
+
+  # ── late-page quarantine (the #145 risk) ─────────────────────────────────────
+
+  test "a timed-out new_page contaminates the lease and retires the browser, never reusing it" do
+    # The fake fails new_page with exactly what CDPEx.Browser returns on a stalled
+    # page open — the tab may still appear on Chrome afterwards.
+    pool =
+      start_pool(
+        size: 1,
+        start_fun: fn _ -> PageBrowser.start_link(new_page: {:error, {:timeout, :new_page}}) end
+      )
+
+    parent = self()
+
+    assert_retires(pool, :contaminated, fn ->
+      result =
+        Pool.with_page(pool, fn _page ->
+          send(parent, :fun_should_not_run)
+          :ran
+        end)
+
+      assert result == {:error, {:timeout, :new_page}}
+    end)
+
+    refute_receive :fun_should_not_run
+    # The contaminated browser was retired and its slot freed; the next call gets a
+    # brand-new browser (a different pid), so a late tab can't bleed across rentals.
+    assert eventually(fn -> :sys.get_state(pool).count == 0 end)
+
+    # A fresh backfill browser serves the next rental; the fun's own value is
+    # returned (not an :ok tuple), proving the replacement is fully usable.
+    assert :ok =
+             Pool.with_browser(pool, fn b ->
+               assert is_pid(b)
+               :ok
+             end)
+  end
+
+  test "a late page opened after the timeout stays on the retired browser, not the next lease" do
+    # new_page sleeps past the with_page deadline, then opens the tab anyway: the
+    # real "page arrives late and unowned" shape. with_page's own deadline fires
+    # first; we then contaminate explicitly (as the pool would on a true new_page
+    # timeout — here simulated deterministically).
+    pool =
+      start_pool(size: 1, start_fun: fn _ -> PageBrowser.start_link(new_page: {:delay, 200}) end)
+
+    {:ok, lease} = Pool.checkout(pool)
+    {:ok, tainted} = Lease.browses(lease)
+
+    # Simulate the caller giving up while new_page is still in flight.
+    Lease.contaminate(lease, {:timeout, :new_page})
+
+    assert_retires(pool, :contaminated, fn ->
+      Pool.checkin(pool, lease)
+    end)
+
+    # The retired browser's stop runs as the pool settles the lease.
+    assert eventually(fn -> not Process.alive?(tainted) end)
+
+    # The replacement browser is a distinct process; whatever the tainted browser's
+    # late open produced can never be observable through it.
+    {:ok, lease2} = Pool.checkout(pool, 1_000)
+    {:ok, replacement} = Lease.browses(lease2)
+    assert replacement != tainted
+    assert :sys.get_state(replacement).open == %{}
+  end
+
+  test "a clean with_page keeps the warm browser in rotation (no false retirement)" do
+    pool = start_pool(size: 1, start_fun: fn _ -> PageBrowser.start_link([]) end)
+
+    assert :ok =
+             Pool.with_page(pool, fn page ->
+               assert is_binary(page.target_id)
+               :ok
+             end)
+
+    # The lease settles asynchronously (its EXIT, not the checkin cast, updates the
+    # pool), so wait for the browser to be shelved before reading internal state.
+    assert eventually(fn ->
+             st = :sys.get_state(pool)
+             st.count == 1 and length(st.available) == 1 and map_size(st.busy) == 0
+           end)
+  end
+
+  # ── checkin idempotence / stale leases ────────────────────────────────────────
+
+  test "checkin is idempotent: a second checkin after settlement is a no-op" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+
+    :ok = Pool.checkin(pool, lease)
+    assert eventually(fn -> not Process.alive?(lease) end)
+    :ok = Pool.checkin(pool, lease)
+    assert :sys.get_state(pool).count == 1
+  end
+
+  test "a contaminated lease that already ended drops the contaminate cast harmlessly" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    :ok = Pool.checkin(pool, lease)
+    assert eventually(fn -> not Process.alive?(lease) end)
+
+    # Cast to a dead lease: GenServer.cast never raises, pool state stays coherent.
+    :ok = Lease.contaminate(lease, :too_late)
+    assert {:ok, _l} = Pool.checkout(pool, 500)
+  end
+
+  # ── pool stop ─────────────────────────────────────────────────────────────────
 
   test "stopping the pool replies to blocked waiters instead of crashing them" do
     pool = start_pool(size: 1)
-    {:ok, _b1} = Pool.checkout(pool)
+    {:ok, _l1} = Pool.checkout(pool)
 
     task = Task.async(fn -> Pool.checkout(pool, 5_000) end)
     refute Task.yield(task, 100), "the second checkout should be blocked"
@@ -115,11 +266,23 @@ defmodule CDPEx.PoolTest do
     assert {:error, :noproc} = Task.await(task)
   end
 
+  test "a pool stop takes its leases down with it" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    {:ok, browser} = Lease.browses(lease)
+
+    Pool.stop(pool)
+    assert_down(lease)
+    assert_down(browser)
+  end
+
   test "child_spec derives its id from :id or :name so multiple pools can be supervised" do
     assert Pool.child_spec([]).id == Pool
     assert Pool.child_spec(name: :fast).id == :fast
     assert Pool.child_spec(id: :custom, name: :fast).id == :custom
   end
+
+  # ── launch lifecycle ──────────────────────────────────────────────────────────
 
   test "a launch failure surfaces to the checkout caller" do
     pool = start_pool(size: 1, start_fun: fn _ -> {:error, :launch_boom} end)
@@ -163,7 +326,7 @@ defmodule CDPEx.PoolTest do
 
     # Release the launch; the original caller is served.
     send(launcher, :proceed)
-    assert {:ok, _b} = Task.await(slow, 2_000)
+    assert {:ok, _lease} = Task.await(slow, 2_000)
   end
 
   test "launches browsers concurrently for simultaneous waiters (#22)" do
@@ -185,7 +348,8 @@ defmodule CDPEx.PoolTest do
     holders =
       for _ <- 1..3 do
         spawn(fn ->
-          {:ok, b} = Pool.checkout(pool, 3_000)
+          {:ok, lease} = Pool.checkout(pool, 3_000)
+          {:ok, b} = Lease.browses(lease)
           send(test, {:got, b})
           receive do: (:release -> :ok), after: (5_000 -> :ok)
         end)
@@ -222,7 +386,7 @@ defmodule CDPEx.PoolTest do
     capture_log(fn ->
       Process.exit(task_sup, :kill)
 
-      # Rather than limping on unable to launch, the pool stops so its own supervisor can
+      # Rather than limping unable to launch, the pool stops so its own supervisor can
       # restart it with a fresh task_sup.
       assert_receive {:DOWN, ^ref, :process, ^pool, {:task_sup_down, :killed}}, 1_000
     end)
@@ -246,7 +410,7 @@ defmodule CDPEx.PoolTest do
     # The launch completes with no waiter left — its browser is kept as a warm spare, not
     # leaked, and a later checkout reuses it (count stays 1, no second launch).
     send(launcher, :proceed)
-    assert {:ok, _b} = Pool.checkout(pool, 1_000)
+    assert {:ok, _lease} = Pool.checkout(pool, 1_000)
     assert :sys.get_state(pool).count == 1
   end
 
@@ -281,7 +445,7 @@ defmodule CDPEx.PoolTest do
 
     pool = start_pool(size: 1, start_fun: capturing_start)
 
-    {:ok, _b} = Pool.checkout(pool, 1_000)
+    {:ok, _lease} = Pool.checkout(pool, 1_000)
     assert_receive {:launch_opts, opts}
     assert opts[:owner] == pool
   end
@@ -325,10 +489,123 @@ defmodule CDPEx.PoolTest do
     send(la, {:proceed_error, :boom})
     send(lb, :proceed_ok)
 
-    assert_receive {:w2, {:ok, _browser}}, 2_000
+    assert_receive {:w2, {:ok, _lease}}, 2_000
     send(w1, :stop)
     send(w2, :stop)
   end
+
+  # ── concurrent backfill under retirement ─────────────────────────────────────
+
+  test "retiring a browser under concurrent waiters backfills without handing out a dead pid" do
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    {:ok, tainted} = Lease.browses(lease)
+    parent = self()
+
+    # Long-lived waiter owners: a Task that exits right after checkout would have its
+    # lease reclaimed by the owner monitor before we can inspect it. These stay parked
+    # until the test releases them, so each lease stays live for the assertions.
+    waiters =
+      for _ <- 1..2 do
+        spawn(fn ->
+          {:ok, waiter_lease} = Pool.checkout(pool, 3_000)
+          {:ok, browser} = Lease.browses(waiter_lease)
+          send(parent, {:served, waiter_lease, browser})
+          receive do: (:release -> :ok)
+        end)
+      end
+
+    # Both waiters queue behind the single occupied slot.
+    assert eventually(fn -> :queue.len(:sys.get_state(pool).waiting) == 2 end)
+
+    Lease.contaminate(lease, :simulated)
+    Pool.checkin(pool, lease)
+
+    # The first waiter is served immediately by the backfill browser (the retired slot
+    # relaunched on dispatch). It must be a live browser that is never the tainted pid.
+    assert_receive {:served, l1, b1}, 3_000
+    assert Process.alive?(b1)
+    refute b1 == tainted
+
+    # Releasing the first rental frees the backfill browser for the second waiter, who
+    # has been blocked the whole time. It too gets a live, non-tainted instance — never
+    # a dead or retired pid.
+    send(Enum.at(waiters, 0), :release)
+    Pool.checkin(pool, l1)
+    assert_receive {:served, _l2, b2}, 3_000
+    assert Process.alive?(b2)
+    refute b2 == tainted
+    assert b2 == b1, "the second waiter should reuse the warm backfill browser"
+    assert :sys.get_state(pool).count == 1
+
+    send(Enum.at(waiters, 1), :release)
+  end
+
+  test "a burst of owner deaths retires each lease's own browser and heals back to size" do
+    pool = start_pool(size: 3)
+
+    for _ <- 1..3 do
+      parent = self()
+
+      spawn(fn ->
+        {:ok, lease} = Pool.checkout(pool, 2_000)
+        {:ok, browser} = Lease.browses(lease)
+        send(parent, {:rental, lease, browser})
+        Process.sleep(:infinity)
+      end)
+    end
+
+    rentals =
+      for _ <- 1..3 do
+        assert_receive {:rental, lease, browser}, 2_000
+        {lease, browser}
+      end
+
+    # All three owners die at once; each lease must settle independently.
+    for {lease, browser} <- rentals do
+      owner = :sys.get_state(lease).owner
+      Process.exit(owner, :kill)
+      assert_down(lease)
+      assert eventually(fn -> not Process.alive?(browser) end)
+    end
+
+    # The pool healed: three fresh browsers are serviceable again.
+    browsers =
+      for _ <- 1..3 do
+        {:ok, l} = Pool.checkout(pool, 3_000)
+        {:ok, b} = Lease.browses(l)
+        b
+      end
+
+    assert length(Enum.uniq(browsers)) == 3
+    assert :sys.get_state(pool).count == 3
+  end
+
+  # ── telemetry ─────────────────────────────────────────────────────────────────
+
+  test "retirement emits [:cdp_ex, :pool, :browser_retired] with the reason" do
+    attach([[:cdp_ex, :pool, :browser_retired]])
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+
+    Lease.contaminate(lease, {:timeout, :new_page})
+    Pool.checkin(pool, lease)
+
+    assert_receive {:telemetry, [:cdp_ex, :pool, :browser_retired], _measurements,
+                    %{reason: {:contaminated, {:timeout, :new_page}}}},
+                   1_000
+  end
+
+  test "a clean check-in emits no retirement event" do
+    attach([[:cdp_ex, :pool, :browser_retired]])
+    pool = start_pool(size: 1)
+    {:ok, lease} = Pool.checkout(pool)
+    Pool.checkin(pool, lease)
+
+    refute_receive {:telemetry, [:cdp_ex, :pool, :browser_retired], _, _}, 200
+  end
+
+  # ── helpers ───────────────────────────────────────────────────────────────────
 
   defp start_pool(opts) do
     {:ok, pool} =
@@ -342,6 +619,46 @@ defmodule CDPEx.PoolTest do
     if Process.alive?(pool), do: Pool.stop(pool)
   catch
     :exit, _ -> :ok
+  end
+
+  defp assert_down(pid) do
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+  end
+
+  # Run `fun` and assert a browser_retired event with the given tagged reason
+  # (`:contaminated` / `:abandoned` / `:lease_stopped`) fires while it runs.
+  defp assert_retires(pool, tag, fun) when is_function(fun, 0) do
+    attach([[:cdp_ex, :pool, :browser_retired]], "retire-#{:erlang.unique_integer([:positive])}")
+    fun.()
+
+    assert_receive {:telemetry, [:cdp_ex, :pool, :browser_retired], _m, %{reason: reason}}, 1_000
+
+    assert is_tuple(reason) and elem(reason, 0) == tag,
+           "expected a #{inspect(tag)} retirement, got #{inspect(reason)}"
+
+    # Drain any additional retirement events from earlier assertions in this test.
+    drain_retirements()
+    pool
+  end
+
+  defp drain_retirements do
+    receive do
+      {:telemetry, [:cdp_ex, :pool, :browser_retired], _, _} -> drain_retirements()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp attach(events, id \\ nil) do
+    id = id || "pool-test-#{:erlang.unique_integer([:positive])}"
+    :telemetry.attach_many(id, events, &__MODULE__.forward/4, self())
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  @doc false
+  def forward(event, measurements, metadata, test_pid) do
+    send(test_pid, {:telemetry, event, measurements, metadata})
   end
 
   defp eventually(fun, retries \\ 100) do

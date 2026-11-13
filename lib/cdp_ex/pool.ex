@@ -1,6 +1,7 @@
 defmodule CDPEx.Pool do
   @moduledoc """
-  A fixed-size pool of reusable `CDPEx.Browser` processes.
+  A fixed-size pool of reusable `CDPEx.Browser` processes, with isolated,
+  self-healing **leases**.
 
   Launching Chrome is expensive — a cold start can take several seconds on a
   constrained host, with a fresh profile each time. A pool keeps browsers warm
@@ -14,17 +15,52 @@ defmodule CDPEx.Pool do
         CDPEx.Page.html(page)
       end)
 
-  Browsers are launched **lazily** up to `:size` and reused thereafter.
-  `checkout/2` blocks (up to `:checkout_timeout`) when every browser is busy. The
-  pool is resilient: a caller that crashes while holding a browser has it returned
-  automatically, and a browser that crashes is dropped and relaunched on demand —
-  so `:size` self-heals. Put the pool under your supervision tree; its
-  `terminate/2` stops every browser, reaping Chrome.
+  ## Leases
+
+  Every `checkout/2` starts a `CDPEx.Lease` — a small process that identifies
+  that one rental and owns its fate. `checkout/2` returns the **lease pid**,
+  not the browser pid; resolve the browser with `CDPEx.Lease.browses/1` (or use
+  `with_browser/3` / `with_page/3`, which do it for you) and end the rental with
+  `checkin/2`. The lease makes each rental independent:
+
+    * **Timeout, cancellation and owner death only clean up its own resources.**
+      A caller that crashes while holding a lease settles just that lease; other
+      rentals and other waiters are untouched.
+    * **A late page can't bleed into the next rental.** A `new_page/2` that
+      times out may still open its tab afterwards, unowned. `with_page/3` marks
+      that lease's browser **contaminated** (`CDPEx.Lease.contaminate/2`), so at
+      check-in the browser is retired and replaced instead of going back on the
+      shelf with a stray tab — the next lease always gets a clean browser.
+    * **Suspicious browsers retire and self-heal.** An owner that dies mid-rental
+      also retires the browser it was using (its work may be half-done), and a
+      browser that crashes is dropped outright. Each retirement frees capacity;
+      the next waiting checkout launches a replacement, so `:size` heals itself
+      and no waiter is ever handed a dead or retired instance.
+
+  Browsers are launched **lazily** up to `:size`. `checkout/2` blocks (up to
+  `:checkout_timeout`) when every browser is busy. Put the pool under your
+  supervision tree; its `terminate/2` stops every browser, reaping Chrome.
 
   Browser launches are **asynchronous** — each cold start (a cold Chrome can take a
   few seconds) runs in its own task, so the pool keeps serving checkouts, checkins,
   and timeouts while browsers warm up, and a pool growing to `:size` under load
   launches them concurrently. `:checkout_timeout` is honored even during warmup.
+
+  ## Telemetry
+
+  `[:cdp_ex, :pool, :browser_retired]` fires whenever a browser is taken out of
+  rotation rather than returned cleanly — measurements `%{system_time: ...}`,
+  metadata `%{reason: reason}` where `reason` is one of:
+
+    * `{:contaminated, inner}` — a checked-in browser was marked suspect (the
+      typical case: a timed-out `new_page/2` whose tab may still open late)
+    * `{:abandoned, exit_reason}` — its owner died while holding the lease
+    * `{:lease_stopped, reason}` — a lease stopped any other way, so its browser
+      is treated as untrusted
+
+  A browser that crashed outright emits the usual `[:cdp_ex, :error]` fault
+  event(s) instead; its lease frees the slot and the pool backfills it without
+  a retirement event.
 
   ## Options
 
@@ -39,7 +75,9 @@ defmodule CDPEx.Pool do
 
   alias CDPEx.Browser
   alias CDPEx.Exits
+  alias CDPEx.Lease
   alias CDPEx.ProcessLabel
+  alias CDPEx.Telemetry
 
   require Logger
 
@@ -54,6 +92,8 @@ defmodule CDPEx.Pool do
     :start_fun,
     :task_sup,
     available: [],
+    # lease_pid => {browser_pid, owner_pid}. One entry per live rental; the lease
+    # pid is the rental's identity, so every settle path touches only its own slot.
     busy: %{},
     waiting: :queue.new(),
     # task_ref => true for each in-flight async launch; counts toward :size so
@@ -88,13 +128,16 @@ defmodule CDPEx.Pool do
   end
 
   @doc """
-  Borrows a browser, blocking up to `timeout` ms when all are busy.
+  Borrows a browser under a fresh lease, blocking up to `timeout` ms when all are
+  busy.
 
-  Returns `{:ok, browser}`, `{:error, :timeout}`, or `{:error, reason}` if a
-  browser had to be launched and failed — a launch error is reported to a waiting
-  caller and is generally worth retrying. A caller still waiting when the pool stops
-  gets `{:error, :noproc}`. **Always** `checkin/2` it when done — or use
-  `with_browser/3` / `with_page/3`, which do that for you.
+  Returns `{:ok, lease}` where `lease` is a `CDPEx.Lease` pid — resolve the
+  browser with `CDPEx.Lease.browses/1` and **always** finish with `checkin/2`
+  (or use `with_browser/3` / `with_page/3`, which do both for you). Other
+  returns: `{:error, :timeout}` if no browser freed in time, `{:error, reason}`
+  if a browser had to be launched and failed — a launch error is reported to a
+  waiting caller and is generally worth retrying. A caller still waiting when
+  the pool stops gets `{:error, :noproc}`.
   """
   @spec checkout(GenServer.server(), timeout()) :: {:ok, pid()} | {:error, term()}
   def checkout(pool, timeout \\ @default_checkout_timeout) do
@@ -112,24 +155,31 @@ defmodule CDPEx.Pool do
     :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
   end
 
-  @doc "Returns a browser borrowed with `checkout/2`."
+  @doc """
+  Ends a lease started with `checkout/2`. A clean lease returns its browser to
+  the pool; a contaminated or ownerless lease retires it instead. Idempotent —
+  a second call (or one racing the lease's own death) is a no-op.
+  """
   @spec checkin(GenServer.server(), pid()) :: :ok
-  def checkin(pool, browser), do: GenServer.cast(pool, {:checkin, browser})
+  def checkin(_pool, lease) when is_pid(lease), do: Lease.done(lease)
 
   @doc """
-  Runs `fun` with a checked-out browser, returning it afterwards (even if `fun`
-  raises). Returns `fun`'s value, or `{:error, reason}` if no browser was free.
+  Runs `fun` with a checked-out browser pid, ending the lease afterwards (even if
+  `fun` raises). Returns `fun`'s value, or `{:error, reason}` if no browser was
+  free or the lease ended before it could resolve the browser.
   """
   @spec with_browser(GenServer.server(), (pid() -> result), timeout()) ::
           result | {:error, term()}
         when result: var
   def with_browser(pool, fun, timeout \\ @default_checkout_timeout) when is_function(fun, 1) do
     case checkout(pool, timeout) do
-      {:ok, browser} ->
+      {:ok, lease} ->
         try do
-          fun.(browser)
+          with {:ok, browser} <- Lease.browses(lease) do
+            fun.(browser)
+          end
         after
-          checkin(pool, browser)
+          checkin(pool, lease)
         end
 
       {:error, _} = error ->
@@ -138,9 +188,9 @@ defmodule CDPEx.Pool do
   end
 
   @doc """
-  Runs `fun` with a fresh page on a pooled browser, cleaning up the page and
-  returning the browser afterwards. The pooled counterpart of `CDPEx.with_page/3`
-  — it reuses a warm browser instead of launching one per call.
+  Runs `fun` with a fresh page on a leased browser, cleaning up the page and
+  ending the lease afterwards. The pooled counterpart of `CDPEx.with_page/3` —
+  it reuses a warm browser instead of launching one per call.
 
   `opts` are forwarded to `CDPEx.with_page/3` (e.g. `:prevent_alerts`, or
   `:deadline`, which closes the page — not the pooled browser — and whose clock
@@ -148,16 +198,47 @@ defmodule CDPEx.Pool do
   `:checkout_timeout` to bound that wait.
   Returns `fun`'s value, or `{:error, reason}`.
 
-  A `{:error, {:timeout, :new_page}}` means the browser could not serve the page in
-  time and may still open it later, unowned; that browser goes back into the pool, so
-  repeated timeouts can pile pages up on it. Restart the pool if they recur.
+  If `new_page/2` times out (`{:error, {:timeout, :new_page}}`) the browser may
+  still open that page later with no owner, so the lease is **contaminated**: its
+  browser is retired on check-in and a replacement is launched, rather than
+  handed to the next job with a stray tab. A `:deadline` firing after the page
+  exists is different — the deadline watchdog closes that specific page, so the
+  browser stays clean and returns to rotation.
   """
   @spec with_page(GenServer.server(), (CDPEx.Page.t() -> result), keyword()) ::
           result | {:error, term()}
         when result: var
   def with_page(pool, fun, opts \\ []) when is_function(fun, 1) do
     {timeout, page_opts} = Keyword.pop(opts, :checkout_timeout, @default_checkout_timeout)
-    with_browser(pool, fn browser -> CDPEx.with_page(browser, fun, page_opts) end, timeout)
+
+    case checkout(pool, timeout) do
+      {:ok, lease} ->
+        try do
+          with {:ok, browser} <- Lease.browses(lease) do
+            run_leased_page(pool, lease, browser, fun, page_opts)
+          end
+        after
+          checkin(pool, lease)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # Open the page through the ordinary CDPEx.with_page machinery (deadline, page
+  # cleanup and exit containment all live there). The pool only adds lease
+  # hygiene: a timed-out new_page can still complete late and unowned, so retire
+  # that browser rather than risk the late tab — e.g. a previous job's login page
+  # — surfacing in the next rental.
+  defp run_leased_page(_pool, lease, browser, fun, page_opts) do
+    result = CDPEx.with_page(browser, fun, page_opts)
+
+    if match?({:error, {:timeout, :new_page}}, result) do
+      Lease.contaminate(lease, {:timeout, :new_page})
+    end
+
+    result
   end
 
   @doc "Stops the pool, stopping every browser (and reaping Chrome). `:ok` if it is already gone."
@@ -173,8 +254,8 @@ defmodule CDPEx.Pool do
 
   @impl true
   def init(opts) do
-    # Trap exits: browsers are start_linked, so a browser crash arrives as an
-    # {:EXIT, _, _} we handle (drop + relaunch on demand) rather than taking the
+    # Trap exits: browsers and leases are start_linked, so their crashes arrive as
+    # {:EXIT, _, _} messages we settle (retire/drop/relaunch) rather than taking the
     # pool down, and terminate/2 runs to reap Chrome.
     Process.flag(:trap_exit, true)
 
@@ -200,11 +281,6 @@ defmodule CDPEx.Pool do
     # otherwise it waits in the queue for a checkin/crash to free a browser.
     timer = arm_timeout(from, timeout)
     {:noreply, dispatch(%{state | waiting: :queue.in({from, timer}, state.waiting)})}
-  end
-
-  @impl true
-  def handle_cast({:checkin, browser}, state) do
-    {:noreply, state |> release(browser) |> dispatch()}
   end
 
   @impl true
@@ -242,12 +318,11 @@ defmodule CDPEx.Pool do
     {:noreply, launch_failed(%{state | launching: Map.delete(launching, ref)}, reason)}
   end
 
-  def handle_info({:DOWN, ref, :process, _owner, _reason}, state) do
-    # A checkout owner died without checking in — reclaim its browser.
-    case find_busy_by_ref(state.busy, ref) do
-      nil -> {:noreply, state}
-      browser -> {:noreply, state |> release(browser) |> dispatch()}
-    end
+  def handle_info({:EXIT, lease, reason}, state) when is_map_key(state.busy, lease) do
+    # A lease settled. The lease is linked (not just monitored), so its stop reason
+    # arrives here as the exit reason — unwrap the lease's end_reason (see
+    # CDPEx.Lease). Settle only this lease's slot; every other rental is untouched.
+    {:noreply, state |> settle_lease(lease, lease_reason(reason)) |> dispatch()}
   end
 
   def handle_info({:EXIT, task_sup, reason}, %__MODULE__{task_sup: task_sup} = state) do
@@ -258,9 +333,10 @@ defmodule CDPEx.Pool do
   end
 
   def handle_info({:EXIT, browser, _reason}, state) do
-    # A pooled browser stopped/crashed. Drop it; capacity frees up, so dispatch
-    # can serve a waiting caller by launching a replacement.
-    {:noreply, state |> drop(browser) |> dispatch()}
+    # A pooled browser stopped/crashed. It may be available, busy (its lease will
+    # settle separately with :browser_gone), or already removed by that lease.
+    # Drop it wherever it is; capacity frees up so dispatch can launch a replacement.
+    {:noreply, state |> drop_browser(browser) |> dispatch()}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -275,8 +351,10 @@ defmodule CDPEx.Pool do
       GenServer.reply(from, {:error, :noproc})
     end)
 
+    # Leases are linked to us; stopping the browsers below makes their monitors
+    # fire, but nothing will read those messages again.
     Enum.each(state.available, &safe_stop/1)
-    Enum.each(Map.keys(state.busy), &safe_stop/1)
+    Enum.each(Map.values(state.busy), fn {browser, _owner} -> safe_stop(browser) end)
 
     # An in-flight launch may finish a browser we never adopted: once the task runs
     # Process.unlink/1, that browser is linked to nobody, so killing task_sup won't reap it.
@@ -411,41 +489,91 @@ defmodule CDPEx.Pool do
     end
   end
 
-  # Mark `browser` busy for the waiter, monitor the owner (auto-checkin on its
-  # death), cancel the wait timer, and reply.
+  # Hand `browser` to the waiter under a fresh lease. The lease pid is the rental's
+  # identity: it monitors the owner and the browser, and its linked EXIT settles
+  # this exact slot. Cancel the wait timer and reply with the lease, not the browser.
   defp assign(state, browser, {from, timer}) do
-    _ = cancel_timer(timer)
     owner = elem(from, 0)
-    ref = Process.monitor(owner)
-    GenServer.reply(from, {:ok, browser})
-    %{state | busy: Map.put(state.busy, browser, {owner, ref})}
-  end
+    _ = cancel_timer(timer)
 
-  # Return a busy browser to the available set (a checkin, or an owner's death).
-  defp release(state, browser) do
-    case Map.pop(state.busy, browser) do
-      {nil, _busy} ->
-        state
+    case Lease.start_link(self(), owner, browser) do
+      {:ok, lease} ->
+        GenServer.reply(from, {:ok, lease})
+        %{state | busy: Map.put(state.busy, lease, {browser, owner})}
 
-      {{_owner, ref}, busy} ->
-        Process.demonitor(ref, [:flush])
-        # Don't return an already-dead browser (its {:EXIT} may not be processed
-        # yet) to the available set, or dispatch could hand a dead pid to a waiter.
-        # Drop it instead; the {:EXIT} path reconciles anything this misses.
-        if Process.alive?(browser) do
-          %{state | busy: busy, available: [browser | state.available]}
-        else
-          %{state | busy: busy, count: state.count - 1}
-        end
+      {:error, reason} ->
+        # The lease itself couldn't start (extreme system limits). Never hand out a
+        # browser with no lease guarding it: retire this one and fail the waiter,
+        # leaving the queue/dispatch invariants intact for the next caller.
+        Logger.error("[CDPEx.Pool] failed to start a lease: #{inspect(reason)}")
+        safe_stop(browser)
+        GenServer.reply(from, {:error, reason})
+        %{state | count: state.count - 1}
     end
   end
 
-  # Remove a dead browser from wherever it is and shrink the count.
-  defp drop(state, browser) do
+  # Unwrap a lease's settle reason (see CDPEx.Lease.stop_reason/1). A clean check-in
+  # exits plain :shutdown; anything else carries the end_reason. An exit we don't
+  # recognize (e.g. the lease itself crashing) is treated as an untrusted stop.
+  defp lease_reason(:shutdown), do: :normal
+  defp lease_reason({:shutdown, {:lease_exit, reason}}), do: reason
+  defp lease_reason(other), do: {:lease_stopped, other}
+
+  # Settle a lease. Its busy entry (one counted browser) is popped first. Retirement
+  # and browser-death paths decrement count here, unconditionally: the popped entry
+  # proves the browser occupied a slot. A browser {:EXIT} that landed first already
+  # removed it from busy, so settle_lease is never even called for that lease — the
+  # two paths can't both decrement the same slot.
+  defp settle_lease(state, lease, reason) do
+    {{browser, _owner}, busy} = Map.pop(state.busy, lease)
+    state = %{state | busy: busy}
+
+    case reason do
+      :normal ->
+        # Clean check-in. Don't shelf an already-dead browser (its {:EXIT} may not be
+        # processed yet): drop it instead; the EXIT path reconciles anything missed.
+        if Process.alive?(browser) do
+          %{state | available: [browser | state.available]}
+        else
+          %{state | count: state.count - 1}
+        end
+
+      {:abandoned, exit_reason} ->
+        # The owner died mid-rental. Its page work may be half-done: never reuse this
+        # browser for another job — retire it and let dispatch launch a replacement.
+        retire(state, browser, {:abandoned, exit_reason})
+
+      :browser_gone ->
+        # The browser died first; free the slot the popped entry was accounting for.
+        %{state | count: state.count - 1}
+
+      {:lease_stopped, _} = stop_reason ->
+        # The lease stopped for a reason it didn't wrap: don't trust its browser.
+        retire(state, browser, stop_reason)
+
+      contamination ->
+        # A check-in after contaminate/2: never reuse a browser that may carry a late
+        # unowned tab — retire and backfill.
+        retire(state, browser, {:contaminated, contamination})
+    end
+  end
+
+  # Take a browser out of rotation and shrink the count. Called only from
+  # settle_lease/2, whose popped busy entry guarantees this browser held exactly one
+  # counted slot — so the decrement is unconditional here. Stopping is best-effort.
+  defp retire(state, browser, reason) do
+    Telemetry.pool_browser_retired(reason)
+
+    safe_stop(browser)
+    %{state | count: state.count - 1}
+  end
+
+  # Remove a dead browser from wherever it is and shrink the count. A busy browser's
+  # lease settles separately; here we only make sure count never counts a corpse.
+  defp drop_browser(state, browser) do
     cond do
-      Map.has_key?(state.busy, browser) ->
-        {{_owner, ref}, busy} = Map.pop(state.busy, browser)
-        Process.demonitor(ref, [:flush])
+      Enum.any?(state.busy, fn {_lease, {b, _owner}} -> b == browser end) ->
+        busy = Map.reject(state.busy, fn {_lease, {b, _owner}} -> b == browser end)
         %{state | busy: busy, count: state.count - 1}
 
       browser in state.available ->
@@ -454,10 +582,6 @@ defmodule CDPEx.Pool do
       true ->
         state
     end
-  end
-
-  defp find_busy_by_ref(busy, ref) do
-    Enum.find_value(busy, fn {browser, {_owner, r}} -> if r == ref, do: browser end)
   end
 
   defp remove_waiter(waiting, from) do

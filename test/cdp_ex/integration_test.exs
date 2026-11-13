@@ -15,6 +15,7 @@ defmodule CDPEx.IntegrationTest do
   alias CDPEx.Browser
   alias CDPEx.Connection
   alias CDPEx.FixtureServer
+  alias CDPEx.Lease
   alias CDPEx.Page
   alias CDPEx.Pool
   alias CDPEx.ProxyAuthServer
@@ -59,15 +60,6 @@ defmodule CDPEx.IntegrationTest do
         end)
 
       assert result == {:error, :noproc}
-    end
-
-    # kill -9 Chrome, then wait for the Browser to stop on the port's exit status (its
-    # terminate/2 still reaps the profile dir).
-    defp kill_chrome(browser) do
-      os_pid = :sys.get_state(browser).chrome.os_pid
-      ref = Process.monitor(browser)
-      {_, 0} = System.cmd("kill", ["-9", to_string(os_pid)])
-      assert_receive {:DOWN, ^ref, :process, ^browser, _reason}, 10_000
     end
   end
 
@@ -1791,6 +1783,228 @@ defmodule CDPEx.IntegrationTest do
         assert_receive {:DOWN, ^bref, :process, ^browser, _reason}, 10_000
       end)
     end
+
+    test "an owner that dies mid-lease retires only its browser; another live rental keeps working",
+         %{fixture: fixture} do
+      {:ok, pool} = Pool.start_link(size: 2)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      # Rental A, held by a separate owner process that we will kill.
+      owner_a =
+        spawn(fn ->
+          {:ok, lease} = Pool.checkout(pool)
+          {:ok, _browser} = Lease.browses(lease)
+          receive do: (:hold -> :ok)
+        end)
+
+      # Rental B, owned by the test process — it must survive owner A's death.
+      {:ok, lease_b} = Pool.checkout(pool)
+      {:ok, browser_b} = Lease.browses(lease_b)
+      lease_ref = Process.monitor(owner_a)
+
+      assert eventually(fn -> :sys.get_state(pool).count == 2 end)
+      browser_a = busy_browser_other_than(pool, browser_b)
+
+      # Kill owner A while it still holds its lease. Its lease settles as abandoned
+      # and its browser is retired — rental B's browser is a different pid, untouched.
+      Process.exit(owner_a, :kill)
+      assert_receive {:DOWN, ^lease_ref, :process, ^owner_a, _reason}, 10_000
+
+      assert eventually(fn -> :sys.get_state(pool).count == 1 end)
+      assert eventually(fn -> not Process.alive?(browser_a) end)
+      assert Process.alive?(browser_b)
+
+      # The surviving browser still serves real work — isolation, not a pool-wide reset.
+      assert {:ok, _} =
+               CDPEx.with_page(browser_b, fn page -> Page.navigate(page, fixture) end)
+
+      Pool.checkin(pool, lease_b)
+
+      # Two checkouts heal the pool back to size 2: the first reuses the warm
+      # survivor, the second launches a fresh backfill browser — alive, and never
+      # the retired pid. No waiter is handed a dead instance.
+      assert {:ok, lease_c} = Pool.checkout(pool, 20_000)
+      assert {:ok, browser_c} = Lease.browses(lease_c)
+      assert browser_c == browser_b
+
+      assert {:ok, lease_d} = Pool.checkout(pool, 20_000)
+      assert {:ok, browser_d} = Lease.browses(lease_d)
+      assert Process.alive?(browser_d)
+      refute browser_d == browser_a
+      assert eventually(fn -> :sys.get_state(pool).count == 2 end)
+
+      Pool.checkin(pool, lease_c)
+      Pool.checkin(pool, lease_d)
+    end
+
+    test "a browser that crashes mid-lease frees the slot and the next checkout gets a fresh one",
+         %{fixture: fixture} do
+      {:ok, pool} = Pool.start_link(size: 1)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      {:ok, lease} = Pool.checkout(pool)
+      {:ok, browser} = Lease.browses(lease)
+      lease_ref = Process.monitor(lease)
+
+      capture_log(fn -> kill_chrome(browser) end)
+
+      # The lease itself settles (its browser monitor fires); a blocked caller would
+      # never be handed this dead pid.
+      assert_receive {:DOWN, ^lease_ref, :process, ^lease, _reason}, 10_000
+      assert eventually(fn -> :sys.get_state(pool).count == 0 end)
+
+      # Backfill: a new checkout launches a replacement browser.
+      assert {:ok, new_lease} = Pool.checkout(pool, 20_000)
+      assert {:ok, new_browser} = Lease.browses(new_lease)
+      assert Process.alive?(new_browser)
+      refute new_browser == browser
+      Pool.checkin(pool, new_lease)
+
+      # The replacement serves real page work on a subsequent rental.
+      assert Pool.with_page(
+               pool,
+               fn page ->
+                 {:ok, _} = Page.navigate(page, fixture)
+                 :ok
+               end,
+               checkout_timeout: 30_000
+             ) == :ok
+
+      assert eventually(fn -> :sys.get_state(pool).count == 1 end)
+    end
+
+    test "a disconnected (Chrome killed) pooled browser is replaced and the pool heals back to size" do
+      {:ok, pool} = Pool.start_link(size: 2)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      {:ok, lease1} = Pool.checkout(pool)
+      {:ok, lease2} = Pool.checkout(pool)
+      {:ok, browser1} = Lease.browses(lease1)
+      {:ok, browser2} = Lease.browses(lease2)
+      assert eventually(fn -> :sys.get_state(pool).count == 2 end)
+
+      # A raw disconnect: the OS process (and therefore the WebSocket) is gone.
+      capture_log(fn -> kill_chrome(browser1) end)
+      Pool.checkin(pool, lease1)
+      Pool.checkin(pool, lease2)
+
+      assert eventually(fn -> :sys.get_state(pool).count == 1 end)
+      refute Process.alive?(browser1)
+      assert Process.alive?(browser2)
+
+      # Two fresh checkouts: one reuses the warm survivor, the other launches a
+      # backfill — neither returns the disconnected pid.
+      assert {:ok, l3} = Pool.checkout(pool, 20_000)
+      assert {:ok, l4} = Pool.checkout(pool, 20_000)
+      {:ok, b3} = Lease.browses(l3)
+      {:ok, b4} = Lease.browses(l4)
+
+      assert Process.alive?(b3) and Process.alive?(b4)
+      assert b3 != browser1 and b4 != browser1
+      assert b3 == browser2, "the warm survivor should be reused before a fresh launch"
+      assert eventually(fn -> :sys.get_state(pool).count == 2 end)
+
+      Pool.checkin(pool, l3)
+      Pool.checkin(pool, l4)
+    end
+
+    test "a timed-out new_page retires the leased browser and its replacement never carries the late tab",
+         %{fixture: fixture} do
+      # A real new_page/2 can't be made to time out deterministically against healthy
+      # Chrome (its 75s ceiling is a pathological bound), so this exercises the exact
+      # pool action a real {:timeout, :new_page} triggers — Lease.contaminate/2 — on a
+      # real browser, then proves the end-to-end quarantine/backfill against real Chrome.
+      # The timeout→contaminate wiring itself is covered with the fakes in pool_test.exs.
+      {:ok, pool} = Pool.start_link(size: 1)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+      attach_telemetry([[:cdp_ex, :pool, :browser_retired]])
+
+      {:ok, lease} = Pool.checkout(pool)
+      {:ok, tainted} = Lease.browses(lease)
+
+      # Open a real tab that stands in for the late, unowned page: with the lease
+      # contaminated, this whole browser must be taken out of rotation with it.
+      assert {:ok, stray_page} = CDPEx.new_page(tainted)
+      assert is_pid(stray_page.conn)
+
+      Lease.contaminate(lease, {:timeout, :new_page})
+      Pool.checkin(pool, lease)
+
+      assert_receive {:telemetry, [:cdp_ex, :pool, :browser_retired], _,
+                      %{reason: {:contaminated, {:timeout, :new_page}}}},
+                     5_000
+
+      # The tainted browser (stray tab included) is stopped, not re-shelved.
+      assert eventually(fn -> not Process.alive?(tainted) end)
+      assert eventually(fn -> :sys.get_state(pool).count == 0 end)
+
+      # The next rental lands on a brand-new browser — no pid reuse. The late tab
+      # died with the retired browser, so it can never surface in this rental.
+      assert {:ok, fresh_lease} = Pool.checkout(pool, 20_000)
+      assert {:ok, fresh} = Lease.browses(fresh_lease)
+      assert Process.alive?(fresh)
+      refute fresh == tainted
+      Pool.checkin(pool, fresh_lease)
+
+      # The replacement serves ordinary work cleanly on a subsequent rental.
+      assert Pool.with_page(
+               pool,
+               fn page ->
+                 {:ok, _} = Page.navigate(page, fixture)
+                 :ok
+               end,
+               checkout_timeout: 30_000
+             ) == :ok
+
+      assert eventually(fn -> :sys.get_state(pool).count == 1 end)
+    end
+
+    test "concurrent checkouts backfill two retired browsers without ever serving a dead pid" do
+      {:ok, pool} = Pool.start_link(size: 2)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      # Fill both slots, then retire both browsers via contaminated check-ins.
+      {:ok, l1} = Pool.checkout(pool)
+      {:ok, l2} = Pool.checkout(pool)
+      {:ok, b1} = Lease.browses(l1)
+      {:ok, b2} = Lease.browses(l2)
+      assert eventually(fn -> :sys.get_state(pool).count == 2 end)
+
+      Lease.contaminate(l1, :simulated)
+      Lease.contaminate(l2, :simulated)
+      Pool.checkin(pool, l1)
+      Pool.checkin(pool, l2)
+      assert eventually(fn -> :sys.get_state(pool).count == 0 end)
+      assert eventually(fn -> not Process.alive?(b1) and not Process.alive?(b2) end)
+
+      # Two owners concurrently block on the empty pool; the backfill launches two
+      # fresh browsers and each waiter gets a distinct, live instance.
+      parent = self()
+
+      owners =
+        for _ <- 1..2 do
+          spawn(fn ->
+            {:ok, lease} = Pool.checkout(pool, 30_000)
+            {:ok, browser} = Lease.browses(lease)
+            send(parent, {:served, lease, browser})
+            receive do: (:release -> :ok)
+          end)
+        end
+
+      served =
+        for _ <- 1..2 do
+          assert_receive {:served, lease, browser}, 40_000
+          assert Process.alive?(browser)
+          refute browser in [b1, b2]
+          {lease, browser}
+        end
+
+      assert served |> Enum.map(fn {_l, b} -> b end) |> Enum.uniq() |> length() == 2
+      assert eventually(fn -> :sys.get_state(pool).count == 2 end)
+
+      Enum.each(owners, &send(&1, :release))
+      Enum.each(served, fn {lease, _b} -> Pool.checkin(pool, lease) end)
+    end
   end
 
   describe "telemetry" do
@@ -1953,6 +2167,26 @@ defmodule CDPEx.IntegrationTest do
     if Process.alive?(pool), do: Pool.stop(pool)
   catch
     :exit, _ -> :ok
+  end
+
+  # kill -9 Chrome, then wait for the Browser to stop on the port's exit status (its
+  # terminate/2 still reaps the profile dir). The browser's termination report is
+  # expected; wrap calls in capture_log/1 where the test would otherwise print it.
+  defp kill_chrome(browser) do
+    os_pid = :sys.get_state(browser).chrome.os_pid
+    ref = Process.monitor(browser)
+    {_, 0} = System.cmd("kill", ["-9", to_string(os_pid)])
+    assert_receive {:DOWN, ^ref, :process, ^browser, _reason}, 10_000
+  end
+
+  # The other busy browser in a size-2 pool (the busy map is lease => {browser, owner}).
+  defp busy_browser_other_than(pool, browser) do
+    pool
+    |> :sys.get_state()
+    |> Map.fetch!(:busy)
+    |> Map.values()
+    |> Enum.map(fn {b, _owner} -> b end)
+    |> Enum.find(&(&1 != browser))
   end
 
   # Poll until `fun` is true or the deadline passes — for event-driven state (e.g.
